@@ -22,7 +22,7 @@ with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=DeprecationWarning)
     from pysnmp.carrier.asynsock.dispatch import AsynsockDispatcher
     from pysnmp.carrier.asynsock.dgram import udp
-    from pysnmp.proto.api import decodeMessageVersion, v2c, protoVersion2c
+    from pysnmp.proto.api import decodeMessageVersion, v2c, protoVersion2c, v1, protoVersion1
     from pyasn1.codec.ber import decoder
 
 from . import utils
@@ -51,15 +51,20 @@ def _trap_receiver(trap_filter, host, port, timeout):
                                  robot.utils.secs_to_timestr(timeout))
 
     def _trap_receiver_cb(transport, domain, sock, msg):
-        if decodeMessageVersion(msg) != protoVersion2c:
+        if decodeMessageVersion(msg) == protoVersion1:
+            req, msg = decoder.decode(msg, asn1Spec=v1.Message())
+            pdu = v1.apiMessage.getPDU(req)
+        elif decodeMessageVersion(msg) == protoVersion2c:
+            req, msg = decoder.decode(msg, asn1Spec=v2c.Message())
+            pdu = v2c.apiMessage.getPDU(req)
+        else:
             raise RuntimeError('Only SNMP v2c traps are supported.')
 
-        req, msg = decoder.decode(msg, asn1Spec=v2c.Message())
-        pdu = v2c.apiMessage.getPDU(req)
-
         # ignore any non trap PDUs
-        if not pdu.isSameTypeWith(v2c.TrapPDU()):
+        if not pdu.isSameTypeWith(v2c.TrapPDU()) and not pdu.isSameTypeWith(v1.TrapPDU()):
             return
+
+        print(pdu)
 
         # Stop the receiver if the trap we are looking for was received.
         if trap_filter(domain, sock, pdu):
