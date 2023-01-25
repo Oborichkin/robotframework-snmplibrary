@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+import logging
 import warnings
 import functools
 
@@ -22,10 +23,12 @@ with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=DeprecationWarning)
     from pysnmp.carrier.asynsock.dispatch import AsynsockDispatcher
     from pysnmp.carrier.asynsock.dgram import udp
-    from pysnmp.proto.api import decodeMessageVersion, v2c, protoVersion2c, v1, protoVersion1
+    from pysnmp.proto.api import decodeMessageVersion, v2c, v1, protoModules, protoVersion1, protoVersion2c
     from pyasn1.codec.ber import decoder
 
 from . import utils
+
+logger = logging.getLogger(__name__)
 
 
 def _generic_trap_filter(domain, sock, pdu, **kwargs):
@@ -34,16 +37,32 @@ def _generic_trap_filter(domain, sock, pdu, **kwargs):
         if sock[0] != kwargs['host']:
             return False
 
-    for oid, val in v2c.apiPDU.getVarBindList(pdu):
-        if 'oid' in kwargs and kwargs['oid']:
-            if oid == snmpTrapOID:
-                if val[0][0][2] != v2c.ObjectIdentifier(kwargs['oid']):
-                    return False
+    if pdu.isSameTypeWith(v2c.TrapPDU()):
+        for oid, val in v2c.apiPDU.getVarBindList(pdu):
+            if 'oid' in kwargs and kwargs['oid']:
+                if oid == snmpTrapOID:
+                    if val[0][0][2] != v2c.ObjectIdentifier(kwargs['oid']):
+                        return False
+    elif pdu.isSameTypeWith(v1.TrapPDU()):
+        logger.warning("No OID filtering for v1 Traps! Skipping")
+    else:
+        return False
+
     return True
+
+
+def _trap_to_dict(pdu, version, pMod):
+    if version == protoVersion1:
+        var_binds = pMod.apiTrapPDU.getVarBinds(pdu)
+    else:
+        var_binds = pMod.apiPDU.getVarBinds(pdu)
+
+    return {oid.prettyPrint(): val.prettyPrint() for oid, val in  var_binds}
 
 
 def _trap_receiver(trap_filter, host, port, timeout):
     started = time.time()
+    result = None
 
     def _trap_timer_cb(now):
         if now - started > timeout:
@@ -51,23 +70,20 @@ def _trap_receiver(trap_filter, host, port, timeout):
                                  robot.utils.secs_to_timestr(timeout))
 
     def _trap_receiver_cb(transport, domain, sock, msg):
-        if decodeMessageVersion(msg) == protoVersion1:
-            req, msg = decoder.decode(msg, asn1Spec=v1.Message())
-            pdu = v1.apiMessage.getPDU(req)
-        elif decodeMessageVersion(msg) == protoVersion2c:
-            req, msg = decoder.decode(msg, asn1Spec=v2c.Message())
-            pdu = v2c.apiMessage.getPDU(req)
+        nonlocal result
+        ver = int(decodeMessageVersion(msg))
+
+        if ver in protoModules:
+            pMod = protoModules[ver]
         else:
-            raise RuntimeError('Only SNMP v2c traps are supported.')
+            raise RuntimeError('Unsupported SNMP version %s.' % ver)
 
-        # ignore any non trap PDUs
-        if not pdu.isSameTypeWith(v2c.TrapPDU()) and not pdu.isSameTypeWith(v1.TrapPDU()):
-            return
-
-        print(pdu)
+        req, msg = decoder.decode(msg, asn1Spec=pMod.Message())
+        pdu = pMod.apiMessage.getPDU(req)
 
         # Stop the receiver if the trap we are looking for was received.
         if trap_filter(domain, sock, pdu):
+            result = _trap_to_dict(pdu, ver, pMod)
             transport.jobFinished(1)
 
     dispatcher = AsynsockDispatcher()
@@ -82,6 +98,7 @@ def _trap_receiver(trap_filter, host, port, timeout):
 
     try:
         dispatcher.runDispatcher()
+        return result
     finally:
         dispatcher.closeDispatcher()
 
@@ -110,4 +127,4 @@ class _Traps:
         trap_filter = self._trap_filters[trap_filter_name]
         timeout = robot.utils.timestr_to_secs(timeout)
 
-        _trap_receiver(trap_filter, host, port, timeout)
+        return _trap_receiver(trap_filter, host, port, timeout)
