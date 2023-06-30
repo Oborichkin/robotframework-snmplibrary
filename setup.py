@@ -76,7 +76,7 @@ def main():
           install_requires=[
               'robotframework',
               'pysnmp',
-
+              'pyasn1==0.4.8'
           ],
           cmdclass={
               'build_libdoc': run_build_libdoc,
